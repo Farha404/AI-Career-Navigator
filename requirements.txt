@@ -8,4 +8,4 @@ pdfplumber
 pypdf
 joblib
 requests
-gTTSgit
+gTTS
