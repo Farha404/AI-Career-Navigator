@@ -408,7 +408,7 @@ def main():
 
         # Model info
         st.markdown(f"**Model:** `{bundle.model_name}`")
-        st.markdown(f"**Feature Set:** `Features without overlap`  \n({len(bundle.features)} features)")
+        st.markdown(f"**Feature Set:** `Features without overlap`  \n 11 features)")
         st.markdown(f"**Skill Vocabulary:** {len(bundle.SKILL_VOCAB)} canonical skills")
 
         classes = list(getattr(bundle.model, "classes_", [0, 1]))
