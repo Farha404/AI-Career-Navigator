@@ -85,9 +85,20 @@ def extract_education(text: str) -> str:
 
 
 def extract_years_experience(text: str) -> int:
-    """Parse years of experience from free text. (cell 52)"""
+    """
+    Extract approximate *professional work* experience from CV/job text.
+
+    Priority:
+      1. Explicit statements such as ``5 years of experience``.
+      2. Employment date ranges such as ``2019 - Present``.
+
+    Date ranges are only counted when they are not clearly education-related.
+    This prevents ranges such as ``2019 - 2023`` for a BSc from being counted
+    as professional experience.
+    """
     text = str(text).lower()
 
+    # 1) Prefer explicit experience statements.
     explicit = [
         int(m)
         for m in re.findall(
@@ -99,7 +110,8 @@ def extract_years_experience(text: str) -> int:
     explicit += [
         int(m)
         for m in re.findall(
-            r"experience\s*(?:of|:)?\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)",
+            r"experience\s*(?:of|:)?\s*"
+            r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)",
             text,
         )
     ]
@@ -107,21 +119,66 @@ def extract_years_experience(text: str) -> int:
     if explicit:
         return min(max(explicit), 40)
 
-    covered: set = set()
     current_year = datetime.date.today().year
+    covered: set[int] = set()
 
-    for start, end in re.findall(
-        r"\b((?:19|20)\d{2})\s*(?:-|to|–|—)\s*((?:19|20)\d{2}|present|current|now)\b",
-        text,
-    ):
-        start_year = int(start)
-        end_year = (
-            current_year
-            if end in ("present", "current", "now")
-            else int(end)
+    # Words that strongly suggest a date range belongs to education rather
+    # than employment. We inspect nearby text because resumes often use:
+    # "BSc Computer Science | 2019 - 2023".
+    education_terms = re.compile(
+        r"\b(?:education|university|college|school|degree|bsc|msc|mba|"
+        r"bachelor|master|phd|doctorate|diploma|graduat(?:e|ion))\b",
+        re.I,
+    )
+    work_terms = re.compile(
+        r"\b(?:work|worked|experience|employment|professional|engineer|"
+        r"developer|analyst|manager|designer|consultant|intern|internship|"
+        r"developer|scientist|administrator|specialist|lead|director)\b",
+        re.I,
+    )
+
+    date_pattern = re.compile(
+        r"\b((?:19|20)\d{2})\s*(?:-|to|–|—)\s*"
+        r"((?:19|20)\d{2}|present|current|now)\b",
+        re.I,
+    )
+
+    for match in date_pattern.finditer(text):
+        start_year = int(match.group(1))
+        end_raw = match.group(2).lower()
+        end_year = current_year if end_raw in {"present", "current", "now"} else int(end_raw)
+
+        if not (0 <= end_year - start_year <= 40):
+            continue
+
+        # Look around the date range. If it is clearly attached to an
+        # education entry, do not count it as work experience.
+        # Prefer the local resume entry rather than a large sliding window.
+        # This prevents "BSc 2019-2023. Software Engineer 2023-Present"
+        # from making the education range look like work experience.
+        left = max(
+            text.rfind("\n", 0, match.start()),
+            text.rfind(".", 0, match.start()),
+            text.rfind("|", 0, match.start()),
         )
-        if 0 <= end_year - start_year <= 40:
-            covered.update(range(start_year, max(end_year, start_year + 1)))
+        right_candidates = [
+            pos for pos in (
+                text.find("\n", match.end()),
+                text.find(".", match.end()),
+                text.find("|", match.end()),
+            )
+            if pos != -1
+        ]
+        right = min(right_candidates) if right_candidates else len(text)
+        context = text[left + 1:right]
+
+        if education_terms.search(context) and not work_terms.search(context):
+            continue
+
+        # Year-only ranges are necessarily approximate. We count the covered
+        # calendar years and merge overlapping jobs so concurrent jobs are not
+        # double-counted.
+        covered.update(range(start_year, max(end_year, start_year + 1)))
 
     return min(len(covered), 40)
 
