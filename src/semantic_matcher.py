@@ -448,13 +448,26 @@ def _skill_score(
     return gated, round(coverage * 100, 1)
 
 
-def _experience_fit(
-    cand_exp: int,
-    cand_seniority: str,
-    job_blob: str,
-) -> float:
-    """Score experience & seniority alignment. Returns 0.0–1.0."""
-    req_years = extract_years_experience(job_blob) or 0
+def _extract_required_years(job_blob: str) -> int | None:
+    """Extract a stated experience requirement from a job ad."""
+    text = str(job_blob).lower()
+    patterns = (
+        r"\b(\d{1,2})\s*\+?\s*(?:years?|yrs?)\s+"
+        r"(?:of\s+)?(?:relevant\s+|professional\s+)?experience\b",
+        r"\bexperience\s*(?:of|:)?\s*(\d{1,2})\s*\+?\s*"
+        r"(?:years?|yrs?)\b",
+    )
+    values = [
+        int(value)
+        for pattern in patterns
+        for value in re.findall(pattern, text)
+    ]
+    return max(values) if values else None
+
+
+def _experience_fit(cand_exp: int, cand_seniority: str, job_blob: str) -> float:
+    """Score experience and seniority alignment. Returns 0.0 to 1.0."""
+    req_years = _extract_required_years(job_blob) or 0
     if req_years == 0 or cand_exp >= req_years:
         exp_fit = 1.0
     else:
@@ -466,7 +479,6 @@ def _experience_fit(
         sen_rank.get(cand_seniority, 1) - sen_rank.get(job_seniority, 1)
     )
     sen_fit = 1.0 if sen_diff == 0 else (0.80 if sen_diff == 1 else 0.50)
-
     return 0.60 * exp_fit + 0.40 * sen_fit
 
 
@@ -672,7 +684,7 @@ def semantic_match_cv_to_jobs(
                 "job_canonical_title": bundle.canonical_role(job_title),
                 "job_seniority":       extract_seniority(job_title, None),
                 "job_industry":        extract_industry(job_blob, job_tags),
-                "job_required_years":  extract_years_experience(job_blob) or None,
+                "job_required_years": _extract_required_years(job_blob),
                 "job_skills":          sorted(job_skills),
 
                 # ── No legacy debug block needed ──────────────────────

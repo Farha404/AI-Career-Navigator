@@ -84,103 +84,209 @@ def extract_education(text: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def extract_years_experience(text: str) -> int:
+# Existing imports in nlp_utils.py already include re and datetime.
+
+_MONTHS = {
+    name.lower(): number
+    for number, names in enumerate(
+        [
+            ("jan", "january"), ("feb", "february"), ("mar", "march"),
+            ("apr", "april"), ("may",), ("jun", "june"),
+            ("jul", "july"), ("aug", "august"), ("sep", "sept", "september"),
+            ("oct", "october"), ("nov", "november"), ("dec", "december"),
+        ],
+        start=1,
+    )
+    for name in names
+}
+
+_MONTH_PATTERN = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+)
+_DATE_TOKEN = (
+    rf"(?:{_MONTH_PATTERN}\.?\s+\d{{4}}|"
+    rf"\d{{4}}[-/]\d{{1,2}}|\d{{1,2}}[/-]\d{{4}}|\d{{4}})"
+)
+_DATE_RANGE_RE = re.compile(
+    rf"(?P<start>{_DATE_TOKEN})\s*(?:-|to|–|—|through)\s*"
+    rf"(?P<end>{_DATE_TOKEN}|present|current|now)",
+    re.IGNORECASE,
+)
+
+_WORK_HEADINGS = {
+    "experience", "work experience", "professional experience", "employment",
+    "employment history", "work history", "career history", "professional history",
+    "internships", "internship experience", "freelance experience",
+}
+_NONWORK_HEADINGS = {
+    "education", "education and training", "academic background", "academic history",
+    "certifications", "certificates", "licenses and certifications", "courses",
+    "coursework", "training", "projects", "academic projects", "personal projects",
+    "awards", "publications",
+}
+
+_JOB_TITLE_RE = re.compile(
+    r"\b(?:engineer|developer|analyst|scientist|manager|intern|consultant|"
+    r"designer|assistant|coordinator|specialist|administrator|technician|"
+    r"teacher|researcher|accountant|architect|director|lead|officer|"
+    r"representative|operator|editor|nurse|doctor|professor|instructor|"
+    r"executive|recruiter|marketing|sales|support|technologist)\b",
+    re.IGNORECASE,
+)
+_EMPLOYMENT_RE = re.compile(
+    r"\b(?:worked|working|employed|employment|job|position|role|responsibilit(?:y|ies)|"
+    r"full[- ]?time|part[- ]?time|freelance|self[- ]employed|intern(?:ship)?|"
+    r"contract(?:or)?|company|employer|client|staff|promoted|managed|developed|"
+    r"built|designed|led|delivered|maintained|supported|served)\b",
+    re.IGNORECASE,
+)
+_NONWORK_CONTEXT_RE = re.compile(
+    r"\b(?:university|college|school|bachelor|master|phd|doctorate|degree|"
+    r"certification|certificate|course|coursework|bootcamp|graduat(?:ed|ion)|"
+    r"academic|student|semester|thesis|diploma)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_heading(line: str) -> str:
+    line = re.sub(r"^[\s#*•|\-]+|[\s:*#•|\-]+$", "", line.lower())
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def _parse_resume_date(token: str, today: datetime.date) -> tuple[int, int]:
+    """Return (year, month). Year-only dates are interpreted as January."""
+    value = token.strip().lower().rstrip(".")
+
+    if value in {"present", "current", "now"}:
+        return today.year, today.month
+
+    year_month = re.fullmatch(r"(\d{4})[-/](\d{1,2})", value)
+    if year_month:
+        year, month = int(year_month.group(1)), int(year_month.group(2))
+        if not 1 <= month <= 12:
+            raise ValueError("invalid month")
+        return year, month
+
+    month_year = re.fullmatch(r"(\d{1,2})[/-](\d{4})", value)
+    if month_year:
+        month, year = int(month_year.group(1)), int(month_year.group(2))
+        if not 1 <= month <= 12:
+            raise ValueError("invalid month")
+        return year, month
+
+    month_year = re.fullmatch(
+        rf"({_MONTH_PATTERN})\.?\s+(\d{{4}})", value, re.IGNORECASE
+    )
+    if month_year:
+        month_name = month_year.group(1).lower().rstrip(".")
+        return int(month_year.group(2)), _MONTHS[month_name]
+
+    if re.fullmatch(r"\d{4}", value):
+        return int(value), 1
+
+    raise ValueError(f"unsupported date token: {token}")
+
+
+def _date_range_months(
+    start_token: str,
+    end_token: str,
+    today: datetime.date,
+) -> tuple[int, int] | None:
+    try:
+        start_year, start_month = _parse_resume_date(start_token, today)
+        end_year, end_month = _parse_resume_date(end_token, today)
+    except ValueError:
+        return None
+
+    start_index = start_year * 12 + start_month - 1
+    end_index = end_year * 12 + end_month - 1
+
+    if end_token.strip().lower() in {"present", "current", "now"}:
+        end_index += 1  # Include the current month.
+    elif not re.fullmatch(r"\d{4}", end_token.strip()):
+        end_index += 1  # Month/year end dates include the named month.
+
+    if end_index < start_index or end_index - start_index > 40 * 12:
+        return None
+    if end_index == start_index:
+        end_index += 1
+
+    return start_index, end_index
+
+
+def extract_years_experience(
+    text: str,
+    today: datetime.date | None = None,
+) -> int:
+    """Count unique months in dated work roles, excluding education and training.
+
+    Internships, freelance, contract, and part-time work count when the entry
+    has role or employment evidence. Concurrent roles count once. This function
+    intentionally does not trust free-text totals such as "5 years of experience".
     """
-    Extract approximate *professional work* experience from CV/job text.
+    today = today or datetime.date.today()
+    lines = str(text or "").splitlines()
+    if not lines:
+        return 0
 
-    Priority:
-      1. Explicit statements such as ``5 years of experience``.
-      2. Employment date ranges such as ``2019 - Present``.
+    section_by_line = []
+    section = "unknown"
+    for line in lines:
+        heading = _normalize_heading(line)
+        if heading in _WORK_HEADINGS:
+            section = "work"
+        elif heading in _NONWORK_HEADINGS:
+            section = "nonwork"
+        section_by_line.append(section)
 
-    Date ranges are only counted when they are not clearly education-related.
-    This prevents ranges such as ``2019 - 2023`` for a BSc from being counted
-    as professional experience.
-    """
-    text = str(text).lower()
-
-    # 1) Prefer explicit experience statements.
-    explicit = [
-        int(m)
-        for m in re.findall(
-            r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)"
-            r"\b(?:\s+of)?(?:\s+\w+){0,3}?\s+experience",
-            text,
-        )
-    ]
-    explicit += [
-        int(m)
-        for m in re.findall(
-            r"experience\s*(?:of|:)?\s*"
-            r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)",
-            text,
-        )
-    ]
-
-    if explicit:
-        return min(max(explicit), 40)
-
-    current_year = datetime.date.today().year
-    covered: set[int] = set()
-
-    # Words that strongly suggest a date range belongs to education rather
-    # than employment. We inspect nearby text because resumes often use:
-    # "BSc Computer Science | 2019 - 2023".
-    education_terms = re.compile(
-        r"\b(?:education|university|college|school|degree|bsc|msc|mba|"
-        r"bachelor|master|phd|doctorate|diploma|graduat(?:e|ion))\b",
-        re.I,
-    )
-    work_terms = re.compile(
-        r"\b(?:work|worked|experience|employment|professional|engineer|"
-        r"developer|analyst|manager|designer|consultant|intern|internship|"
-        r"developer|scientist|administrator|specialist|lead|director)\b",
-        re.I,
-    )
-
-    date_pattern = re.compile(
-        r"\b((?:19|20)\d{2})\s*(?:-|to|–|—)\s*"
-        r"((?:19|20)\d{2}|present|current|now)\b",
-        re.I,
-    )
-
-    for match in date_pattern.finditer(text):
-        start_year = int(match.group(1))
-        end_raw = match.group(2).lower()
-        end_year = current_year if end_raw in {"present", "current", "now"} else int(end_raw)
-
-        if not (0 <= end_year - start_year <= 40):
+    intervals = []
+    for line_index, line in enumerate(lines):
+        ranges = list(_DATE_RANGE_RE.finditer(line))
+        if not ranges:
             continue
 
-        # Look around the date range. If it is clearly attached to an
-        # education entry, do not count it as work experience.
-        # Prefer the local resume entry rather than a large sliding window.
-        # This prevents "BSc 2019-2023. Software Engineer 2023-Present"
-        # from making the education range look like work experience.
-        left = max(
-            text.rfind("\n", 0, match.start()),
-            text.rfind(".", 0, match.start()),
-            text.rfind("|", 0, match.start()),
+        nearby_indices = range(
+            max(0, line_index - 2),
+            min(len(lines), line_index + 3),
         )
-        right_candidates = [
-            pos for pos in (
-                text.find("\n", match.end()),
-                text.find(".", match.end()),
-                text.find("|", match.end()),
+        context = " ".join(
+            lines[i]
+            for i in nearby_indices
+            if section_by_line[i] == section_by_line[line_index]
+        )
+
+        if section_by_line[line_index] == "nonwork":
+            continue
+        if _NONWORK_CONTEXT_RE.search(context):
+            continue
+        if not (_JOB_TITLE_RE.search(context) or _EMPLOYMENT_RE.search(context)):
+            continue
+
+        for match in ranges:
+            interval = _date_range_months(
+                match.group("start"),
+                match.group("end"),
+                today,
             )
-            if pos != -1
-        ]
-        right = min(right_candidates) if right_candidates else len(text)
-        context = text[left + 1:right]
+            if interval:
+                intervals.append(interval)
 
-        if education_terms.search(context) and not work_terms.search(context):
-            continue
+    if not intervals:
+        return 0
 
-        # Year-only ranges are necessarily approximate. We count the covered
-        # calendar years and merge overlapping jobs so concurrent jobs are not
-        # double-counted.
-        covered.update(range(start_year, max(end_year, start_year + 1)))
+    # Union intervals so overlapping or duplicated jobs do not add months twice.
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
 
-    return min(len(covered), 40)
+    total_months = sum(end - start for start, end in merged)
+    return min(int(total_months / 12 + 0.5), 40)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
