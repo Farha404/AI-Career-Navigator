@@ -1,26 +1,10 @@
 """
 Streamlit application for AI Career Navigator.
 
-Built around final_project.ipynb:
-- Model and NLP artifacts loaded once via @st.cache_resource
-- Live Arbeitnow API jobs cached via @st.cache_data (TTL=10 mins)
-- Full candidate profile extraction & validation
-- Exact notebook feature engineering and model prediction
-- ML model probability ranking with separate skill-coverage explanation
-- Debug mode for inspecting model inputs / outputs
-
-IMPORTANT — terminology used in this app:
-    • "Model Match Probability" = predict_proba(X)[:, positive_class]
-      This is the trained XGBoost model's probability that the
-      candidate-job pair belongs to the positive (match) class.
-      It is NOT a hire probability and NOT a skill percentage.
-
-    • "Prediction" = model.predict(X)
-      Binary classification result (MATCHED / NOT MATCHED).
-      Threshold: 0.5 on the positive-class probability.
-
-    • "Skill Coverage" = shared must-have skills / total must-have skills
-      This is a separate explanation metric, NOT the model prediction.
+Production ranking uses the heuristic semantic matcher and fitted NLP artifacts.
+The saved classifier is a separate training experiment, not the active ranker.
+Match scores are compatibility points, not calibrated probabilities.
+Skill coverage is a separate explanation metric.
 """
 
 import streamlit as st
@@ -31,7 +15,6 @@ from src.artifacts import ArtifactBundle
 from src.cv_extractor import extract_cv_profile, validate_cv
 from src.job_api import get_jobs
 from src.job_cleaner import clean_jobs
-from src.matcher import match_cv_to_jobs                     # kept for reference
 from src.semantic_matcher import semantic_match_cv_to_jobs   # new holistic engine
 from src.learning_recommendations import recommend_learning  # study plan for missing skills
 
@@ -248,7 +231,7 @@ def _render_job_card(job: dict, show_debug: bool, candidate_skills: list[str] | 
     badge_cls = "badge-match" if is_match else "badge-no-match"
     badge_txt = "✓ MATCHED" if is_match else "✗ NOT MATCHED"
     remote_txt = "🌐 Remote" if job["remote"] else "🏢 On-site"
-    prob_pct  = job["match_prob_pct"]
+    score_pct  = job["match_score_pct"]
 
     with st.container(border=True):
         # ── Header row ────────────────────────────────────────────────
@@ -264,7 +247,7 @@ def _render_job_card(job: dict, show_debug: bool, candidate_skills: list[str] | 
             st.markdown(
                 f'<div style="text-align:right; padding-top:0.5rem;">'
                 f'<span class="{badge_cls}">{badge_txt}</span>'
-                f'<div class="prob-value" style="margin-top:0.5rem;">{prob_pct:.1f}%</div>'
+                f'<div class="prob-value" style="margin-top:0.5rem;">{score_pct:.1f}/100</div>'
                 f'<div class="prob-label">Match Score</div>'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -346,8 +329,8 @@ def _render_job_card(job: dict, show_debug: bool, candidate_skills: list[str] | 
         # ── Skill coverage note ───────────────────────────────────────
         cov = job.get("skill_coverage", 0.0)
         st.caption(
-            f"Skill Coverage (explanation only): **{cov:.1f}%** of required skills matched "
-            f"— this is separate from the ML model probability above."
+            f"Skill Coverage (explanation only): **{cov:.1f}%** of required skills matched. "
+            f"This is separate from the heuristic compatibility score above."
         )
 
         # ── Learning recommendations for missing skills ───────────────
@@ -387,7 +370,7 @@ def main():
     st.markdown('<div class="main-header">🎯 AI Career Navigator</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">Upload your CV to find live matching job opportunities '
-        'ranked by your trained ML model\'s match probability.</div>',
+        'ranked by a heuristic candidate-job compatibility score.</div>',
         unsafe_allow_html=True,
     )
 
@@ -406,25 +389,16 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration & Filters")
 
-        # Model info
-        st.markdown(f"**Model:** `{bundle.model_name}`")
-        st.markdown(f"**Feature Set:** `Features without overlap`  \n 11 features)")
-        st.markdown(f"**Skill Vocabulary:** {len(bundle.SKILL_VOCAB)} canonical skills")
-
-        classes = list(getattr(bundle.model, "classes_", [0, 1]))
-        try:
-            pos_idx = classes.index(1)
-        except ValueError:
-            pos_idx = len(classes) - 1
-        st.markdown(f"**Positive class:** `{classes[pos_idx]}` (index {pos_idx})")
+        st.markdown("**Ranking method:** heuristic semantic scorer")
+        st.caption("The trained classifier is not used for the displayed ranking.")
 
         st.divider()
 
         filter_matched_only = st.checkbox("Show Matched Jobs Only", value=True)
-        min_prob = st.slider(
-            "Minimum Match Score (%)",
+        min_score = st.slider(
+            "Minimum Match Score (points)",
             min_value=0, max_value=100, value=50, step=5,
-            help="Filters by the holistic candidate-job match score (0–100%).",
+            help="Filters by heuristic compatibility points (0–100), not a probability.",
         )
         remote_only = st.checkbox("Remote Jobs Only", value=False)
         search_query = st.text_input(
@@ -552,8 +526,8 @@ def main():
     if filter_matched_only:
         filtered = [r for r in filtered if r["matched"]]
 
-    if min_prob > 0:
-        filtered = [r for r in filtered if r["match_prob_pct"] >= min_prob]
+    if min_score > 0:
+        filtered = [r for r in filtered if r["match_score_pct"] >= min_score]
 
     if remote_only:
         filtered = [r for r in filtered if r["remote"]]
@@ -574,15 +548,15 @@ def main():
 
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     col_m1.metric("Live Jobs Analyzed", total_evaluated)
-    col_m2.metric("Matched (≥50%)", total_matched)
+    col_m2.metric("Above provisional threshold (≥50)", total_matched)
     col_m3.metric("Displayed Results", showing_count)
     if all_results:
-        avg_prob = sum(r["match_prob_pct"] for r in all_results) / len(all_results)
-        col_m4.metric("Avg. Match Score", f"{avg_prob:.1f}%")
+        avg_score = sum(r["match_score_pct"] for r in all_results) / len(all_results)
+        col_m4.metric("Avg. Match Score", f"{avg_score:.1f}/100")
 
     if total_matched == 0:
         st.info(
-            "No jobs reached the 50% match threshold. "
+            "No jobs reached the provisional 50-point threshold. "
             "This may mean the available jobs are not closely related to the candidate's profile. "
             "Try unchecking 'Show Matched Jobs Only' to see all results ranked by score."
         )
@@ -605,10 +579,11 @@ def main():
             The skill overlap component is multiplied by the domain compatibility factor.
             If a candidate is an AI/ML Engineer and the job is Head of Sales, the domain
             compatibility is ~0.05 — so even perfect skill overlap would contribute only 5% of 35%.
-            The overall score is hard-capped at 18% for cross-domain mismatches.
+            The overall score is hard-capped at 18 points for cross-domain mismatches.
 
-            **Confidence** reflects how decisively the score sits above or below the 50% threshold.
-            It is not an ML model probability — it is a calibration of how clear-cut the decision is.
+            **Interpretation:** This is a heuristic score out of 100, not a probability.
+            The weights and 50-point threshold are provisional. They have not been validated
+            on independent human-labeled candidate-job pairs.
 
             **Skill Coverage** (shown at the bottom of each card) is a separate explanation metric
             showing what fraction of the job's listed skills the candidate has.
@@ -634,3 +609,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
