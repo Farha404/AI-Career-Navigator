@@ -1,69 +1,100 @@
+"""Offline integration tests for the semantic matcher used by app.py.
+
+These test the production profile-to-ranking path using deterministic NLP
+fixtures. Live API access and serialized model compatibility are separate
+integration concerns; no network or model artifact is required here.
 """
-End-to-end integration test:
-  1. Load ArtifactBundle
-  2. Extract/validate candidate profile from a test CV
-  3. Fetch and clean live jobs from Arbeitnow API
-  4. Run match_cv_to_jobs
-  5. Check output structure, sorting, confidence, and skills
-"""
+import unittest
+from types import SimpleNamespace
 
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
-from src.artifacts import ArtifactBundle
-from src.cv_extractor import validate_cv
-from src.job_api import get_jobs
-from src.job_cleaner import clean_jobs
-from src.matcher import match_cv_to_jobs
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-def run_test():
-    print("=== 1. Loading Artifact Bundle ===")
-    bundle = ArtifactBundle()
-    print("Model loaded successfully:", bundle.model_name)
-    print("Feature set:", bundle.feature_set_name)
-    print("Features count:", len(bundle.features))
+from src.semantic_matcher import (
+    build_extended_candidate_profile,
+    semantic_match_cv_to_jobs,
+)
 
-    print("\n=== 2. Creating Candidate Profile ===")
-    test_cv = """
-    Jane Smith
-    Data Analyst with 3 years of experience.
-    Education: BSc in Computer Science.
-    Skills: Python, SQL, Power BI, Excel, Tableau.
-    Experience:
-    Built SQL queries, dashboards using Power BI and Tableau, and performed data cleaning and reporting using Python and Excel.
-    """
-    candidate = bundle.build_candidate_profile(test_cv)
-    validate_cv(candidate)
-    print("Candidate Role:", candidate["role"])
-    print("Candidate Seniority:", candidate["seniority"])
-    print("Candidate Skills:", candidate["skills"])
 
-    print("\n=== 3. Fetching and Cleaning API Jobs ===")
-    raw_jobs = get_jobs()
-    print(f"Fetched {len(raw_jobs)} raw jobs.")
-    cleaned_jobs = clean_jobs(raw_jobs)
-    print(f"Cleaned {len(cleaned_jobs)} jobs.")
+class UnusedClassifier:
+    def predict(self, *args, **kwargs):
+        raise AssertionError("Semantic ranking must not claim classifier output")
 
-    print("\n=== 4. Matching Candidate Against Live Jobs ===")
-    results = match_cv_to_jobs(candidate, cleaned_jobs, bundle)
-    print(f"Total jobs evaluated: {len(results)}")
+    predict_proba = predict
 
-    matched = [r for r in results if r["matched"]]
-    print(f"Matched jobs (class 1): {len(matched)}")
 
-    # Verify descending confidence sorting
-    confidences = [r["confidence"] for r in results]
-    assert confidences == sorted(confidences, reverse=True), "Results are not sorted by confidence descending!"
-    print("Results sorting verified: strictly descending by confidence.")
+class ProductionMatchingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        corpus = [
+            "software engineer python sql docker rest api software development",
+            "sales representative outbound crm sales targets",
+        ]
+        cls.bundle = SimpleNamespace(
+            SKILL_VOCAB=["Python", "SQL", "Docker", "REST APIs"],
+            SKILL_ALIASES={},
+            tfidf_text=TfidfVectorizer().fit(corpus),
+            tfidf_title=TfidfVectorizer().fit(corpus),
+            canonical_role=lambda title: title,
+            model=UnusedClassifier(),
+        )
+        cls.candidate = build_extended_candidate_profile(
+            """Jane Smith
+Software Engineer
+Skills: Python, SQL, REST APIs
+EDUCATION
+BSc, Example University | 2018 - 2022
+WORK EXPERIENCE
+Software Engineer at Acme | Jan 2023 - Dec 2024
+Developed Python services and SQL queries.
+""",
+            cls.bundle,
+        )
+        cls.jobs = [
+            {
+                "slug": "software", "title": "Software Engineer",
+                "description": "Requires 3 years of experience. Python SQL Docker REST APIs.",
+                "tags": ["Python", "SQL", "Docker"], "company": "Acme",
+            },
+            {
+                "slug": "sales", "title": "Sales Representative",
+                "description": "Outbound sales and CRM; meet sales targets.",
+                "tags": [], "company": "Other",
+            },
+        ]
+        cls.results = semantic_match_cv_to_jobs(cls.candidate, cls.jobs, cls.bundle)
 
-    print("\n=== Top 5 Recommendations ===")
-    for i, r in enumerate(results[:5], 1):
-        print(f"\n{i}. {r['title']} @ {r['company']} ({r['location']})")
-        print(f"   Match status: {r['matched']} | Confidence: {r['confidence_pct']}% | Skill coverage: {r['skill_coverage']}%")
-        print(f"   Shared Skills: {r['shared_skills']}")
-        print(f"   Missing Skills: {r['missing_skills']}")
-        print(f"   URL: {r['url']}")
+    def test_education_does_not_inflate_work_experience(self):
+        self.assertEqual(self.candidate["years_experience"], 2)
 
-    print("\n=== All Tests Passed Successfully! ===")
+    def test_production_path_returns_every_fixture_job(self):
+        self.assertEqual({r["job_id"] for r in self.results}, {"software", "sales"})
+
+    def test_score_schema_and_threshold(self):
+        for result in self.results:
+            self.assertGreaterEqual(result["match_score"], 0)
+            self.assertLessEqual(result["match_score"], 1)
+            self.assertAlmostEqual(result["match_score"] * 100, result["match_score_pct"])
+            self.assertEqual(result["matched"], result["match_score_pct"] >= 50)
+            for field in ("match_probability", "match_prob_pct", "confidence", "confidence_pct"):
+                self.assertNotIn(field, result)
+
+    def test_ranking_and_domain_guard(self):
+        scores = [r["match_score"] for r in self.results]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        by_id = {r["job_id"]: r for r in self.results}
+        self.assertGreater(by_id["software"]["match_score"], by_id["sales"]["match_score"])
+        self.assertLessEqual(by_id["sales"]["match_score_pct"], 18)
+
+    def test_skill_gap_and_job_requirement(self):
+        result = next(r for r in self.results if r["job_id"] == "software")
+        self.assertIn("Python", result["shared_skills"])
+        self.assertIn("Docker", result["missing_skills"])
+        self.assertEqual(result["job_required_years"], 3)
+
+    def test_explanations_and_empty_jobs(self):
+        self.assertTrue(all(r["match_reason"] for r in self.results))
+        self.assertEqual(semantic_match_cv_to_jobs(self.candidate, [], self.bundle), [])
+
 
 if __name__ == "__main__":
-    run_test()
+    unittest.main()

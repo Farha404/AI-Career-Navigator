@@ -21,8 +21,8 @@ THIS MODULE FIXES:
     gates the overall match score, so a single incidental keyword overlap
     from a mismatched domain (e.g. "Forecasting" in Head of Sales) cannot
     produce a high match for an AI/ML Engineer candidate.
-  - Produces a meaningful, varied match score (0–98%) and a separate
-    calibration-based confidence (0.0–0.95).
+  - Produces a heuristic match score (0–98 points). Weights and the
+    decision threshold are provisional, not probability calibration.
   - Generates a human-readable explanation for every result.
 
 EXISTING CODE LEFT UNCHANGED:
@@ -583,9 +583,10 @@ def semantic_match_cv_to_jobs(
     Domain compatibility gates the skill component so a single incidental
     shared skill in a mismatched domain cannot elevate the overall score.
 
-    Returns a list of result dicts sorted by match_percentage descending.
+    Returns a list of result dicts sorted by match_score descending.
 
-    Result schema is a superset of match_cv_to_jobs() so the same UI works.
+    Scores are heuristic compatibility values, not calibrated probabilities.
+    The fixed 50-point decision threshold is provisional.
     """
     extract_skills = _build_extended_extractor(bundle)
 
@@ -631,10 +632,6 @@ def semantic_match_cv_to_jobs(
 
             is_matched = match_pct >= 50.0
 
-            # Confidence: how decisively the score is on one side of the threshold
-            margin = abs(match_pct - 50.0) / 50.0          # 0–1
-            confidence = round(min(0.40 + 0.55 * margin, 0.95), 2)
-
             shared_skills  = sorted(cand_skills & job_skills)
             missing_skills = sorted(job_skills - cand_skills)
             why = _generate_why(
@@ -657,10 +654,8 @@ def semantic_match_cv_to_jobs(
                 "prediction":        int(is_matched),
                 "prediction_label":  "MATCHED" if is_matched else "NOT MATCHED",
                 "matched":           is_matched,
-                "match_probability": round(match_pct / 100, 4),
-                "match_prob_pct":    match_pct,
-                "confidence":        confidence,
-                "confidence_pct":    round(confidence * 100, 1),
+                "match_score":       round(match_pct / 100, 4),
+                "match_score_pct":   match_pct,
 
                 # ── Skill analysis ────────────────────────────────────
                 "shared_skills":  shared_skills,
@@ -695,7 +690,7 @@ def semantic_match_cv_to_jobs(
             logger.warning("Skipping job [%s – %s]: %s", job_slug, job_title, exc)
             continue
 
-    results.sort(key=lambda r: r["match_probability"], reverse=True)
+    results.sort(key=lambda r: r["match_score"], reverse=True)
 
     matched_count = sum(1 for r in results if r["matched"])
     logger.info(
@@ -703,3 +698,4 @@ def semantic_match_cv_to_jobs(
         len(results), matched_count,
     )
     return results
+
